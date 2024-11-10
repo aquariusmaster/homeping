@@ -1,0 +1,140 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CloudFormation template to monitor home router connectivity.
+  A Lambda function checks the TCP connectivity to a specified router host and port, and sends an email via SES upon failure.
+
+Parameters:
+  RouterHost:
+    Type: String
+    Description: The hostname or IP address of your home router.
+  RouterPort:
+    Type: Number
+    Description: The TCP port to check connectivity for (e.g., 80 for HTTP, 443 for HTTPS).
+  SenderEmail:
+    Type: String
+    Description: Verified sender email address in SES.
+  RecipientEmail:
+    Type: String
+    Description: Recipient email address for notifications.
+
+Resources:
+  HomePingFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: HomePingFunction
+      Handler: index.lambda_handler
+      Runtime: python3.8
+      Timeout: 60
+      Role: !GetAtt HomePingExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import socket
+          import boto3
+          import os
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          ses_client = boto3.client('ses')
+          sender_email = os.environ['SENDER_EMAIL']
+          recipient_email = os.environ['RECIPIENT_EMAIL']
+          router_host = os.environ['ROUTER_HOST']
+          router_port = int(os.environ['ROUTER_PORT'])
+
+          def lambda_handler(event, context):
+              try:
+                  is_reachable = check_tcp_connectivity(router_host, router_port)
+                  if not is_reachable:
+                      raise Exception("TCP connection failed")
+                  logger.info("TCP connection successful")
+              except Exception as e:
+                  logger.error(f"Ping failed: {e}")
+                  send_email_notification(str(e))
+
+          def check_tcp_connectivity(host, port, timeout=3):
+              """Check if we can establish a TCP connection to the host on the specified port."""
+              try:
+                  with socket.create_connection((host, port), timeout):
+                      return True
+              except (socket.timeout, ConnectionRefusedError, OSError):
+                  return False
+
+          def send_email_notification(error_message):
+              response = ses_client.send_email(
+                  Source=sender_email,
+                  Destination={'ToAddresses': [recipient_email]},
+                  Message={
+                      'Subject': {'Data': 'Router Connectivity Failure Alert'},
+                      'Body': {
+                          'Text': {
+                              'Data': f'The router at {router_host}:{router_port} is not reachable.\n\nError:\n{error_message}'
+                          }
+                      }
+                  }
+              )
+              logger.info(f"Email sent! Message ID: {response['MessageId']}")
+
+      Environment:
+        Variables:
+          SENDER_EMAIL: !Ref SenderEmail
+          RECIPIENT_EMAIL: !Ref RecipientEmail
+          ROUTER_HOST: !Ref RouterHost
+          ROUTER_PORT: !Ref RouterPort
+    DeletionPolicy: Delete
+
+  HomePingExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: HomePingExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: HomePingExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
+              - Effect: Allow
+                Action:
+                  - ses:SendEmail
+                  - ses:SendRawEmail
+                Resource: '*'
+
+  HomePingLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${HomePingFunction}"  # Match the Lambda function's log group name
+      RetentionInDays: 7  # Retain logs for 7 days
+    DeletionPolicy: Delete
+
+  HomePingScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: "HomePingScheduleRule"
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt HomePingFunction.Arn
+          Id: HomePingFunctionTarget
+    DeletionPolicy: Delete
+
+  HomePingInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: "HomePingFunction"
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt HomePingScheduleRule.Arn
+    DeletionPolicy: Delete
+    
