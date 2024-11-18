@@ -1,7 +1,7 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   CloudFormation template to monitor home router connectivity.
-  A Lambda function checks the TCP connectivity to a specified router host and port, and sends an email via SES upon failure.
+  A Lambda function checks the TCP connectivity to a specified router host and port, stores the previous status in DynamoDB, and sends an email via SES upon status change.
 
 Parameters:
   RouterHost:
@@ -18,6 +18,19 @@ Parameters:
     Description: Recipient email address for notifications.
 
 Resources:
+  HomePingTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Delete
+    Properties:
+      TableName: "HomePingStatusTable"
+      AttributeDefinitions:
+        - AttributeName: "RouterId"
+          AttributeType: "S"
+      KeySchema:
+        - AttributeName: "RouterId"
+          KeyType: "HASH"
+      BillingMode: PAY_PER_REQUEST
+
   HomePingFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -37,43 +50,98 @@ Resources:
           logger.setLevel(logging.INFO)
 
           ses_client = boto3.client('ses')
+          dynamodb = boto3.client('dynamodb')
+
           sender_email = os.environ['SENDER_EMAIL']
           recipient_email = os.environ['RECIPIENT_EMAIL']
           router_host = os.environ['ROUTER_HOST']
-          router_port = int(os.environ['ROUTER_PORT'])
+          router_port = str(os.environ['ROUTER_PORT'])  # Ensure router_port is a string
+          dynamodb_table = os.environ['DYNAMODB_TABLE']
+          router_id = f"{router_host}:{router_port}"  # Combine host and port to form RouterId
 
           def lambda_handler(event, context):
               try:
-                  is_reachable = check_tcp_connectivity(router_host, router_port)
-                  if not is_reachable:
-                      raise Exception("TCP connection failed")
-                  logger.info("TCP connection successful")
+                  # 1. Check current router status
+                  current_status = check_tcp_connectivity(router_host, router_port)
+                  logger.info(f"Current status: {current_status}")
+
+                  # 2. Get previous status from DynamoDB
+                  previous_status = get_previous_status(router_id)
+                  logger.info(f"Previous status: {previous_status}")
+
+                  # 3. If previous status is UNKNOWN, update it and return (no email sent)
+                  if previous_status == "UNKNOWN":
+                      update_status_in_dynamodb(router_id, current_status)
+                      logger.info("Previous status was UNKNOWN. Updated the status in DynamoDB.")
+                      return  # Exit without sending an email
+
+                  # 4. Compare and send notification if status changes
+                  if current_status != previous_status:
+                      if current_status == "FAIL":
+                          send_email_notification(
+                              subject="Router Connectivity Failure Alert",
+                              message=f"The router at {router_host}:{router_port} is not reachable."
+                          )
+                      elif current_status == "SUCCESS":
+                          send_email_notification(
+                              subject="Router Connectivity Restored",
+                              message=f"The router at {router_host}:{router_port} is now reachable."
+                          )
+                      # Update the status in DynamoDB only if there's a status change
+                      update_status_in_dynamodb(router_id, current_status)
+
               except Exception as e:
-                  logger.error(f"Ping failed: {e}")
-                  send_email_notification(str(e))
+                  logger.error(f"An error occurred: {e}")
 
           def check_tcp_connectivity(host, port, timeout=3):
-              """Check if we can establish a TCP connection to the host on the specified port."""
+              """Check if the router is reachable via TCP."""
               try:
-                  with socket.create_connection((host, port), timeout):
-                      return True
+                  with socket.create_connection((host, int(port)), timeout):
+                      return "SUCCESS"
               except (socket.timeout, ConnectionRefusedError, OSError):
-                  return False
+                  return "FAIL"
 
-          def send_email_notification(error_message):
-              response = ses_client.send_email(
-                  Source=sender_email,
-                  Destination={'ToAddresses': [recipient_email]},
-                  Message={
-                      'Subject': {'Data': 'Router Connectivity Failure Alert'},
-                      'Body': {
-                          'Text': {
-                              'Data': f'The router at {router_host}:{router_port} is not reachable.\n\nError:\n{error_message}'
+          def get_previous_status(router_id):
+              """Retrieve the previous status from DynamoDB."""
+              try:
+                  response = dynamodb.get_item(
+                      TableName=dynamodb_table,
+                      Key={"RouterId": {"S": router_id}}
+                  )
+                  return response.get("Item", {}).get("Status", {}).get("S", "UNKNOWN")  # Default to "UNKNOWN"
+              except Exception as e:
+                  logger.error(f"Failed to retrieve previous status: {e}")
+                  return "UNKNOWN"
+
+          def update_status_in_dynamodb(router_id, status):
+              """Update the current status in DynamoDB."""
+              try:
+                  dynamodb.put_item(
+                      TableName=dynamodb_table,
+                      Item={
+                          "RouterId": {"S": router_id},
+                          "Status": {"S": status}
+                      }
+                  )
+              except Exception as e:
+                  logger.error(f"Failed to update status in DynamoDB: {e}")
+
+          def send_email_notification(subject, message):
+              """Send an email notification using Amazon SES."""
+              try:
+                  response = ses_client.send_email(
+                      Source=sender_email,
+                      Destination={'ToAddresses': [recipient_email]},
+                      Message={
+                          'Subject': {'Data': subject},
+                          'Body': {
+                              'Text': {'Data': message}
                           }
                       }
-                  }
-              )
-              logger.info(f"Email sent! Message ID: {response['MessageId']}")
+                  )
+                  logger.info(f"Email sent! Message ID: {response['MessageId']}")
+              except Exception as e:
+                  logger.error(f"Failed to send email: {e}")
 
       Environment:
         Variables:
@@ -81,6 +149,7 @@ Resources:
           RECIPIENT_EMAIL: !Ref RecipientEmail
           ROUTER_HOST: !Ref RouterHost
           ROUTER_PORT: !Ref RouterPort
+          DYNAMODB_TABLE: !Ref HomePingTable
     DeletionPolicy: Delete
 
   HomePingExecutionRole:
@@ -104,11 +173,9 @@ Resources:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
-                Resource: arn:aws:logs:*:*:*
-              - Effect: Allow
-                Action:
+                  - dynamodb:GetItem
+                  - dynamodb:PutItem
                   - ses:SendEmail
-                  - ses:SendRawEmail
                 Resource: '*'
 
   HomePingLogGroup:
@@ -137,4 +204,3 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt HomePingScheduleRule.Arn
     DeletionPolicy: Delete
-    
