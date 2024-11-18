@@ -2,6 +2,8 @@
 
 HomePing is an AWS Lambda-based solution that monitors the connectivity of a specified router by checking TCP connectivity on a specified port. If the router becomes unreachable, HomePing sends an email alert via Amazon SES to notify you of the connectivity issue.
 
+![image](https://github.com/user-attachments/assets/3f519127-6fd0-42f7-b656-51406ddfd830)
+
 ## Features
 
 - Monitors TCP connectivity to a specified router host and port.
